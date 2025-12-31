@@ -134,6 +134,34 @@ class PipelineLogger:
 
 
 # ============================================================================
+# CHECKPOINT MANAGEMENT
+# ============================================================================
+
+def _save_checkpoint(output_dir: Path, results: Dict, checkpoint_name: str) -> None:
+    """Save checkpoint for resume capability."""
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint_path = checkpoint_dir / f"{checkpoint_name}.json"
+    with open(checkpoint_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+
+
+def _load_latest_checkpoint(output_dir: Path) -> Optional[Dict]:
+    """Load the most recent checkpoint if available."""
+    checkpoint_dir = output_dir / "checkpoints"
+    if not checkpoint_dir.exists():
+        return None
+    
+    checkpoints = sorted(checkpoint_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not checkpoints:
+        return None
+    
+    with open(checkpoints[-1], "r") as f:
+        return json.load(f)
+
+
+# ============================================================================
 # PIPELINE STEPS
 # ============================================================================
 
@@ -409,6 +437,7 @@ def step_run_baseline_evaluation(
     
     from nski.evaluation import compute_asr, compute_perplexity
     from nski.evaluation.judges import KeywordRefusalJudge
+    from nski.evaluation.statistical import bootstrap_ci
     
     judge = KeywordRefusalJudge()
     
@@ -434,18 +463,29 @@ def step_run_baseline_evaluation(
         show_progress=False
     )
     
-    log.success(f"Baseline ASR: {results.asr:.3f}, Refusal Rate: {results.refusal_rate:.3f}, PPL: {ppl:.2f}")
+    # Compute bootstrap confidence interval for ASR
+    per_prompt_complied = [1 if not r else 0 for r in getattr(results, 'per_prompt_refused', [])]
+    if per_prompt_complied:
+        asr_ci = bootstrap_ci(per_prompt_complied, confidence=0.95)
+        ci_lower, ci_upper = asr_ci.ci_lower, asr_ci.ci_upper
+    else:
+        ci_lower, ci_upper = results.asr, results.asr
+    
+    log.success(f"Baseline ASR: {results.asr:.3f} [{ci_lower:.3f}, {ci_upper:.3f}], Refusal Rate: {results.refusal_rate:.3f}, PPL: {ppl:.2f}")
     
     return {
         "method": "baseline",
         "model": model_name,
         "asr": results.asr,
+        "asr_ci_lower": ci_lower,
+        "asr_ci_upper": ci_upper,
         "refusal_rate": results.refusal_rate,
         "n_refused": results.n_refused,
         "n_complied": results.n_complied,
         "n_total": results.n_total,
         "perplexity": ppl,
         "avg_latency_ms": results.avg_latency_ms,
+        "per_prompt_refused": getattr(results, 'per_prompt_refused', []),
     }
 
 
@@ -512,12 +552,23 @@ def step_run_nski_evaluation(
     surgeon.cleanup()
     log.success("NSKI surgery removed")
     
-    log.success(f"NSKI ASR: {results.asr:.3f}, Refusal Rate: {results.refusal_rate:.3f}, PPL: {ppl:.2f}")
+    # Compute bootstrap CI for ASR
+    from nski.evaluation.statistical import bootstrap_ci
+    per_prompt_complied = [1 if not r else 0 for r in getattr(results, 'per_prompt_refused', [])]
+    if per_prompt_complied:
+        asr_ci = bootstrap_ci(per_prompt_complied, confidence=0.95)
+        ci_lower, ci_upper = asr_ci.ci_lower, asr_ci.ci_upper
+    else:
+        ci_lower, ci_upper = results.asr, results.asr
+    
+    log.success(f"NSKI ASR: {results.asr:.3f} [{ci_lower:.3f}, {ci_upper:.3f}], Refusal Rate: {results.refusal_rate:.3f}, PPL: {ppl:.2f}")
     
     return {
         "method": "nski",
         "model": model_name,
         "asr": results.asr,
+        "asr_ci_lower": ci_lower,
+        "asr_ci_upper": ci_upper,
         "refusal_rate": results.refusal_rate,
         "n_refused": results.n_refused,
         "n_complied": results.n_complied,
@@ -525,6 +576,7 @@ def step_run_nski_evaluation(
         "perplexity": ppl,
         "avg_latency_ms": results.avg_latency_ms,
         "nski_strength": config.nski_strength,
+        "per_prompt_refused": getattr(results, 'per_prompt_refused', []),
     }
 
 
@@ -1306,6 +1358,29 @@ def step_create_summary(log: PipelineLogger, config: PipelineConfig, all_results
                 f.write(f"1. NSKI reduces ASR by {reduction:.1f}%\n")
                 f.write(f"   - Baseline ASR: {baseline_asr:.3f}\n")
                 f.write(f"   - NSKI ASR: {nski_asr:.3f}\n\n")
+                
+                # Add confidence intervals if available
+                if nski_results[0].get('asr_ci_lower') is not None:
+                    f.write(f"   - NSKI 95% CI: [{nski_results[0]['asr_ci_lower']:.3f}, {nski_results[0]['asr_ci_upper']:.3f}]\n\n")
+                
+                # Statistical analysis
+                try:
+                    from nski.evaluation.statistical import compute_cohens_h
+                    h = compute_cohens_h(baseline_asr, nski_asr)
+                    f.write(f"2. Statistical Analysis:\n")
+                    f.write(f"   - Cohen's h: {h.cohens_h:.3f} ({h.interpretation})\n")
+                    
+                    # McNemar's test if per-prompt data available
+                    if baseline_results[0].get('per_prompt_refused') and nski_results[0].get('per_prompt_refused'):
+                        from nski.evaluation.statistical import mcnemar_test
+                        mc = mcnemar_test(
+                            baseline_results[0]['per_prompt_refused'],
+                            nski_results[0]['per_prompt_refused']
+                        )
+                        sig = "***" if mc.p_value < 0.001 else ("**" if mc.p_value < 0.01 else ("*" if mc.p_value < 0.05 else ""))
+                        f.write(f"   - McNemar's test: chi2={mc.statistic:.2f}, p={mc.p_value:.4f} {sig}\n")
+                except Exception as e:
+                    pass  # Skip stats if not available
         
         f.write("\nFILES GENERATED\n")
         f.write("-" * 40 + "\n")
@@ -1447,6 +1522,10 @@ def run_pipeline(config: PipelineConfig, skip_preflight: bool = False) -> Dict[s
             )
             all_results["main_results"].append(baseline_result)
             
+            # Save checkpoint after baseline
+            if config.save_checkpoints:
+                _save_checkpoint(output_dir, all_results, f"checkpoint_baseline_{model_idx}")
+            
             # Run NSKI (REAL)
             nski_result = step_run_nski_evaluation(
                 log, config, model, tokenizer, model_name, model_config,
@@ -1454,12 +1533,20 @@ def run_pipeline(config: PipelineConfig, skip_preflight: bool = False) -> Dict[s
             )
             all_results["main_results"].append(nski_result)
             
+            # Save checkpoint after NSKI
+            if config.save_checkpoints:
+                _save_checkpoint(output_dir, all_results, f"checkpoint_nski_{model_idx}")
+            
             # Run baseline methods comparison
             baseline_method_results = step_run_baseline_methods(
                 log, config, model, tokenizer, model_name, model_config,
                 advbench_prompts, alpaca_prompts
             )
             all_results["main_results"].extend(baseline_method_results)
+            
+            # Save checkpoint after baselines
+            if config.save_checkpoints:
+                _save_checkpoint(output_dir, all_results, f"checkpoint_baselines_{model_idx}")
             
             # Run ablation study (only for first model to save time)
             if model_idx == 0:
@@ -1469,6 +1556,10 @@ def run_pipeline(config: PipelineConfig, skip_preflight: bool = False) -> Dict[s
                     advbench_prompts, alpaca_prompts
                 )
                 all_results["ablation_results"].extend(ablation_results)
+                
+                # Save checkpoint after ablation
+                if config.save_checkpoints:
+                    _save_checkpoint(output_dir, all_results, f"checkpoint_ablation_{model_idx}")
             
             # Cleanup
             del model
