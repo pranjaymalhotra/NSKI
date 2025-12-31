@@ -44,7 +44,25 @@ class ModelLoader:
     - Tokenizer configuration
     """
     
-    def __init__(self, config: Optional[LoadConfig] = None):
+    def __init__(
+        self,
+        model_name: str = None,
+        device: str = "cuda",
+        quantization: str = "4bit",
+        config: Optional[LoadConfig] = None
+    ):
+        """
+        Initialize ModelLoader.
+        
+        Args:
+            model_name: HuggingFace model name or path
+            device: Device to load on ("cuda" or "cpu")
+            quantization: Quantization type ("4bit", "8bit", or "none")
+            config: Optional LoadConfig object (alternative to individual params)
+        """
+        self.model_name = model_name
+        self.device = device
+        self.quantization = quantization
         self.config = config
         self.model: Optional[PreTrainedModel] = None
         self.tokenizer: Optional[PreTrainedTokenizer] = None
@@ -52,27 +70,45 @@ class ModelLoader:
     
     def load(
         self,
-        model_name: str,
-        device: str = "cuda",
-        load_in_4bit: bool = True,
-        load_in_8bit: bool = False,
+        model_name: str = None,
+        device: str = None,
+        load_in_4bit: bool = None,
+        load_in_8bit: bool = None,
         torch_dtype: str = "float16",
         **kwargs
-    ) -> Tuple[PreTrainedModel, PreTrainedTokenizer, str]:
+    ) -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
         """
         Load a model and tokenizer.
         
         Args:
-            model_name: HuggingFace model name or path
-            device: Device to load on
+            model_name: HuggingFace model name or path (uses self.model_name if not provided)
+            device: Device to load on (uses self.device if not provided)
             load_in_4bit: Use 4-bit quantization
             load_in_8bit: Use 8-bit quantization
             torch_dtype: Torch dtype for model
             **kwargs: Additional arguments for model loading
             
         Returns:
-            Tuple of (model, tokenizer, model_type)
+            Tuple of (model, tokenizer)
         """
+        # Use instance variables if parameters not provided
+        if model_name is None:
+            model_name = self.model_name
+        if device is None:
+            device = self.device
+        
+        # Determine quantization from instance variable if not specified
+        if load_in_4bit is None and load_in_8bit is None:
+            if self.quantization == "4bit":
+                load_in_4bit = True
+                load_in_8bit = False
+            elif self.quantization == "8bit":
+                load_in_4bit = False
+                load_in_8bit = True
+            else:
+                load_in_4bit = False
+                load_in_8bit = False
+        
         logger.info(f"Loading model: {model_name}")
         
         # Get model configuration
@@ -113,13 +149,17 @@ class ModelLoader:
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=dtype,
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
+                bnb_4bit_quant_type="nf4",
+                llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offloading for large models
             )
             model_kwargs["quantization_config"] = bnb_config
             model_kwargs["device_map"] = "auto"
         elif load_in_8bit:
             logger.info("Using 8-bit quantization")
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=True,  # Enable CPU offloading for large models
+            )
             model_kwargs["quantization_config"] = bnb_config
             model_kwargs["device_map"] = "auto"
         else:
@@ -127,11 +167,15 @@ class ModelLoader:
             if device == "cuda":
                 model_kwargs["device_map"] = "auto"
         
-        # Try to use flash attention
+        # Check if flash attention is available before using it
         try:
+            import flash_attn
             model_kwargs["attn_implementation"] = "flash_attention_2"
-        except:
-            pass
+            logger.info("Using Flash Attention 2")
+        except ImportError:
+            # Flash attention not installed, use default (sdpa)
+            model_kwargs["attn_implementation"] = "sdpa"
+            logger.info("Flash Attention not available, using SDPA")
         
         # Merge additional kwargs
         model_kwargs.update(kwargs)
@@ -151,7 +195,7 @@ class ModelLoader:
             memory_gb = torch.cuda.memory_allocated() / 1024**3
             logger.info(f"Model loaded. GPU memory: {memory_gb:.2f} GB")
         
-        return self.model, self.tokenizer, self.model_type
+        return self.model, self.tokenizer
     
     def get_num_layers(self) -> int:
         """Get number of transformer layers."""

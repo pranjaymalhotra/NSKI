@@ -107,3 +107,22 @@ def format_time(seconds: float) -> str:
 def ensure_dir(path: str) -> None:
     """Ensure directory exists."""
     os.makedirs(path, exist_ok=True)
+
+def get_memory_usage() -> float:
+    """Get current memory usage in MB."""
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)  # Convert to MB
+    except:
+        return 0.0
+
+
+def setup_logging(level: str = "INFO") -> None:
+    """Setup logging configuration."""
+    logger.remove()  # Remove default handlers
+    logger.add(
+        lambda msg: print(msg.rstrip()),
+        format="<level>{level: <8}</level> | {message}",
+        level=level
+    )

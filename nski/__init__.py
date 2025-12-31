@@ -29,7 +29,10 @@ from .models import (
 )
 
 from .data import (
-    DatasetDownloader,
+    download_advbench,
+    download_alpaca,
+    download_harmbench,
+    download_all_datasets,
     AdvBenchDataset,
     AlpacaDataset,
     HarmBenchDataset,
@@ -40,9 +43,9 @@ from .evaluation import (
     compute_utility,
     compute_perplexity,
     compute_latency,
-    KeywordJudge,
-    ClassifierJudge,
-    StatisticalAnalyzer,
+    KeywordRefusalJudge,
+    ClassifierRefusalJudge,
+    StatisticalAnalysis,
 )
 
 from .baselines import (
@@ -70,7 +73,10 @@ __all__ = [
     "get_model_config",
     "SUPPORTED_MODELS",
     # Data
-    "DatasetDownloader",
+    "download_advbench",
+    "download_alpaca",
+    "download_harmbench",
+    "download_all_datasets",
     "AdvBenchDataset",
     "AlpacaDataset",
     "HarmBenchDataset",
@@ -79,9 +85,9 @@ __all__ = [
     "compute_utility",
     "compute_perplexity",
     "compute_latency",
-    "KeywordJudge",
-    "ClassifierJudge",
-    "StatisticalAnalyzer",
+    "KeywordRefusalJudge",
+    "ClassifierRefusalJudge",
+    "StatisticalAnalysis",
     # Baselines
     "ArditiSteering",
     "BelitskyModulation",

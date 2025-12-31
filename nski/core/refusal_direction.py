@@ -212,13 +212,16 @@ class RefusalDirectionExtractor:
                         attention_mask = inputs['attention_mask']
                         last_token_idx = attention_mask.sum(dim=1) - 1
                         batch_size = batch_acts.shape[0]
-                        acts = batch_acts[torch.arange(batch_size), last_token_idx]
+                        # Create indices on same device as batch_acts
+                        batch_indices = torch.arange(batch_size, device=batch_acts.device)
+                        last_token_idx = last_token_idx.to(batch_acts.device)
+                        acts = batch_acts[batch_indices, last_token_idx]
                     else:
                         # Mean pool over sequence
-                        attention_mask = inputs['attention_mask'].unsqueeze(-1).float()
+                        attention_mask = inputs['attention_mask'].unsqueeze(-1).float().to(batch_acts.device)
                         acts = (batch_acts * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
                     
-                    all_activations.append(acts)
+                    all_activations.append(acts.cpu())  # Move to CPU to save GPU memory
                     collector.clear()
         
         finally:

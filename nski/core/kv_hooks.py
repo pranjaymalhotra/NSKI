@@ -14,6 +14,12 @@ from typing import Optional, Tuple, Dict, Any, List, Callable
 from dataclasses import dataclass
 from loguru import logger
 
+# Import Conv1D for GPT-2 style models
+try:
+    from transformers.pytorch_utils import Conv1D
+except ImportError:
+    Conv1D = None
+
 
 @dataclass
 class HookConfig:
@@ -204,21 +210,33 @@ class KVCacheHookV2:
     
     This hooks into the v_proj (value projection) linear layer directly,
     which is more reliable across different model implementations.
+    
+    For GPT-2 style models with combined c_attn (Q/K/V), this hook
+    correctly identifies and modifies only the value portion.
     """
     
     def __init__(
         self,
         config: HookConfig,
-        intervention_point: str = "output"  # "output" or "input"
+        intervention_point: str = "output",  # "output" or "input"
+        is_combined_qkv: bool = False,  # True for GPT-2 c_attn
+        hidden_dim: int = None  # Required for combined QKV to extract V
     ):
         self.config = config
         self.intervention_point = intervention_point
+        self.is_combined_qkv = is_combined_qkv
+        self.hidden_dim = hidden_dim
         self.handle: Optional[Any] = None
         self.intervention_count = 0
         
         # Normalize direction
         self.direction = config.refusal_direction.clone()
         self.direction = self.direction / torch.norm(self.direction)
+        
+        if is_combined_qkv and hidden_dim is None:
+            # Try to infer from direction shape
+            self.hidden_dim = self.direction.shape[0]
+            logger.info(f"Combined QKV mode: inferred hidden_dim={self.hidden_dim} from direction shape")
     
     def _hook_fn(
         self,
@@ -229,8 +247,11 @@ class KVCacheHookV2:
         """
         Hook function for value projection output.
         
+        For standard v_proj: modifies the entire output.
+        For GPT-2 c_attn: modifies only the V portion (last 1/3 of output).
+        
         Args:
-            module: The v_proj linear layer
+            module: The v_proj or c_attn linear layer
             input: Input to the layer
             output: Output from the layer (value representations)
             
@@ -240,14 +261,41 @@ class KVCacheHookV2:
         if not self.config.enabled:
             return output
         
-        # Project out refusal direction from output
+        # Project out refusal direction
         direction = self.direction.to(output.device, output.dtype)
         
+        # Handle GPT-2 combined Q/K/V output (c_attn)
+        if self.is_combined_qkv:
+            # output shape: [batch, seq, 3*hidden] where hidden = hidden_dim
+            # Q, K, V are concatenated: [Q | K | V]
+            # We only modify V (the last third)
+            hidden = self.hidden_dim
+            original_shape = output.shape
+            
+            # Split into Q, K, V
+            q = output[..., :hidden]
+            k = output[..., hidden:2*hidden]
+            v = output[..., 2*hidden:]  # This is what we modify
+            
+            # Project out direction from V only
+            v_flat = v.reshape(-1, hidden)
+            projection_coeff = torch.matmul(v_flat, direction.unsqueeze(-1))
+            projection = self.config.strength * projection_coeff * direction.unsqueeze(0)
+            v_modified = v_flat - projection
+            v_modified = v_modified.view(v.shape)
+            
+            # Reconstruct combined output
+            output_modified = torch.cat([q, k, v_modified], dim=-1)
+            
+            self.intervention_count += 1
+            return output_modified
+        
+        # Standard v_proj handling
         # output shape: [batch, seq, hidden_dim] typically
         original_shape = output.shape
         output_flat = output.view(-1, output.shape[-1])
         
-        # V' = V - strength * (V · d) * d
+        # V' = V - strength * (V . d) * d
         projection_coeff = torch.matmul(output_flat, direction.unsqueeze(-1))
         projection = self.config.strength * projection_coeff * direction.unsqueeze(0)
         output_modified = output_flat - projection
@@ -321,13 +369,38 @@ def get_value_proj_layers(model: nn.Module, model_type: str) -> List[nn.Module]:
         model_type: Type of model
         
     Returns:
-        List of v_proj modules
+        List of v_proj modules (or c_attn for GPT-2 style models)
     """
     v_proj_layers = []
     
+    # Define valid layer types
+    valid_types = [nn.Linear]
+    if Conv1D is not None:
+        valid_types.append(Conv1D)
+    valid_types = tuple(valid_types)
+    
+    # First try explicit v_proj naming (LLaMA, Mistral, etc.)
     for name, module in model.named_modules():
-        if 'v_proj' in name.lower() and isinstance(module, nn.Linear):
+        if 'v_proj' in name.lower() and isinstance(module, valid_types):
             v_proj_layers.append(module)
+    
+    # If no v_proj found, try GPT-2 style c_attn (combined Q/K/V)
+    if not v_proj_layers:
+        for name, module in model.named_modules():
+            # GPT-2 uses c_attn which combines Q, K, V projections
+            if name.endswith('.c_attn') and isinstance(module, valid_types):
+                v_proj_layers.append(module)
+    
+    # Also check for attention modules directly
+    if not v_proj_layers:
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            for block in model.transformer.h:
+                if hasattr(block, 'attn'):
+                    v_proj_layers.append(block.attn)
+        elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            for layer in model.model.layers:
+                if hasattr(layer, 'self_attn'):
+                    v_proj_layers.append(layer.self_attn)
     
     logger.info(f"Found {len(v_proj_layers)} value projection layers")
     return v_proj_layers
@@ -354,7 +427,23 @@ def register_kv_hook(
     if hook_type == "v_proj":
         layers = get_value_proj_layers(model, model_type)
         if config.layer_idx < len(layers):
-            hook = KVCacheHookV2(config)
+            # Check if this is GPT-2 style combined Q/K/V (c_attn)
+            layer = layers[config.layer_idx]
+            is_combined_qkv = False
+            hidden_dim = config.refusal_direction.shape[0]
+            
+            # Detect combined QKV from layer output size
+            # Use out_features attribute which works for both nn.Linear and Linear4bit
+            out_features = getattr(layer, 'out_features', None)
+            if out_features is None and hasattr(layer, 'weight'):
+                # Fallback to weight shape
+                out_features = layer.weight.shape[0] if isinstance(layer, nn.Linear) else layer.weight.shape[1]
+            
+            if out_features is not None and out_features == 3 * hidden_dim:
+                is_combined_qkv = True
+                logger.info(f"Detected combined Q/K/V layer (out={out_features}, hidden={hidden_dim})")
+            
+            hook = KVCacheHookV2(config, is_combined_qkv=is_combined_qkv, hidden_dim=hidden_dim)
             hook.register(layers[config.layer_idx])
             return hook
     else:
